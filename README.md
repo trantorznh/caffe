@@ -1,4 +1,6 @@
 # Caffe
+This project add real-time data augmation based on Chenlong Chen's job
+
 
 [![Build Status](https://travis-ci.org/BVLC/caffe.svg?branch=master)](https://travis-ci.org/BVLC/caffe)
 [![License](https://img.shields.io/badge/license-BSD-blue.svg)](LICENSE)
