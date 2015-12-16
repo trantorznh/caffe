@@ -1,5 +1,8 @@
 #ifdef USE_OPENCV
 #include <opencv2/core/core.hpp>
+#include <opencv2/core/mat.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
 #endif  // USE_OPENCV
 
 #include <string>
@@ -9,6 +12,7 @@
 #include "caffe/util/io.hpp"
 #include "caffe/util/math_functions.hpp"
 #include "caffe/util/rng.hpp"
+#include "caffe/util/opencv_util.hpp"
 
 namespace caffe {
 
@@ -36,6 +40,7 @@ DataTransformer<Dtype>::DataTransformer(const TransformationParameter& param,
       mean_values_.push_back(param_.mean_value(c));
     }
   }
+  
 }
 
 template<typename Dtype>
@@ -218,13 +223,28 @@ void DataTransformer<Dtype>::Transform(const vector<cv::Mat> & mat_vector,
   for (int item_id = 0; item_id < mat_num; ++item_id) {
     int offset = transformed_blob->offset(item_id);
     uni_blob.set_cpu_data(transformed_blob->mutable_cpu_data() + offset);
-    Transform(mat_vector[item_id], &uni_blob);
+	if (!param_.multiscale() || phase_ == TRAIN)
+		TransformSingle(mat_vector[item_id], &uni_blob);
+	else
+		TransformMul(mat_vector[item_id], &uni_blob);
   }
 }
 
 template<typename Dtype>
 void DataTransformer<Dtype>::Transform(const cv::Mat& cv_img,
                                        Blob<Dtype>* transformed_blob) {
+	if (!param_.multiscale() || phase_ == TRAIN)
+		TransformSingle(cv_img, transformed_blob);
+	else
+		TransformMul(cv_img, transformed_blob);
+}
+
+
+template<typename Dtype>
+void DataTransformer<Dtype>::TransformSingle(const cv::Mat& img,
+                                       Blob<Dtype>* transformed_blob) {
+  cv::Mat cv_img;
+  img.copyTo(cv_img);
   const int crop_size = param_.crop_size();
   const int img_channels = cv_img.channels();
   const int img_height = cv_img.rows;
@@ -322,6 +342,276 @@ void DataTransformer<Dtype>::Transform(const cv::Mat& cv_img,
       }
     }
   }
+}
+
+template<typename Dtype>
+void DataTransformer<Dtype>::TransformMul(const cv::Mat& cv_img,
+                                       Blob<Dtype>* transformed_blob) {
+									   
+  const int crop_size = param_.crop_size();
+  const bool debug_display = param_.debug_display();
+  const bool contrast_adjustment = param_.contrast_adjustment();
+  const bool smooth_filtering = param_.smooth_filtering();
+  const bool jpeg_compression = param_.jpeg_compression();
+
+
+  const int img_channels = cv_img.channels();
+  const int img_height = cv_img.rows;
+  const int img_width = cv_img.cols;
+
+  // Check dimensions.
+  const int channels = transformed_blob->channels();
+  const int height = transformed_blob->height();
+  const int width = transformed_blob->width();
+  const int num = transformed_blob->num();
+
+  CHECK_EQ(channels, img_channels);
+  CHECK_LE(height, img_height);
+  CHECK_LE(width, img_width);
+  CHECK_GE(num, 1);
+
+  CHECK(cv_img.depth() == CV_8U) << "Image data type must be unsigned byte";
+
+  const Dtype scale = param_.scale();
+  //const bool do_mirror = param_.mirror() && Rand(2);
+  const bool has_mean_file = param_.has_mean_file();
+  const bool has_mean_values = mean_values_.size() > 0;
+
+  CHECK_GT(img_channels, 0);
+  CHECK_GE(img_height, crop_size);
+  CHECK_GE(img_width, crop_size);
+
+  
+  // param for scaling
+  const float min_scaling_factor = param_.min_scaling_factor();
+  const float max_scaling_factor = param_.max_scaling_factor();
+  // param for rotation
+  const float angle_interval = param_.angle_interval();
+  // param for shearing
+  const float max_shearing_ratio = param_.max_shearing_ratio();
+  // param for perspective warpping
+  const float max_perspective_ratio = param_.max_perspective_ratio();
+  // border fill value
+  const cv::Scalar warp_fillval = cv::Scalar::all(param_.warp_fillval());
+
+
+  if (debug_display && phase_ == TRAIN)
+	  cv::imshow("Source", cv_img);
+
+  // Flipping and Reflection -----------------------------------------------------------------
+	int flipping_mode = (Rand(4)) - 1; // -1, 0, 1, 2
+	bool apply_flipping = flipping_mode != 2;
+	if (apply_flipping) {
+		cv::flip(cv_img,cv_img,flipping_mode);
+		if (debug_display && phase_ == TRAIN)
+			cv::imshow("Flipping and Reflection", cv_img);
+	}
+
+
+  // Smooth Filtering -------------------------------------------------------------
+  int smooth_param1 = 3;
+  int apply_smooth = Rand(2);
+  if ( smooth_filtering && apply_smooth ) {
+	int smooth_type = Rand(4); // see opencv_util.hpp
+	smooth_param1 = 3 + 2*(Rand(1));
+        switch(smooth_type){
+        case 0:
+	   //cv::Smooth(cv_img, cv_img, smooth_type, smooth_param1);
+	   cv::GaussianBlur(cv_img, cv_img, cv::Size(smooth_param1,smooth_param1),0);
+           break;
+        case 1:
+           cv::blur(cv_img, cv_img, cv::Size(smooth_param1,smooth_param1));
+           break;
+        case 2:
+           cv::medianBlur(cv_img, cv_img, smooth_param1);
+           break;
+        case 3:
+           cv::boxFilter(cv_img, cv_img, -1, cv::Size(smooth_param1*2,smooth_param1*2));
+           break;
+        }
+	if (debug_display && phase_ == TRAIN)
+      cv::imshow("Smooth Filtering", cv_img);
+  }
+  cv::RNG rng;
+  // Contrast and Brightness Adjuestment ----------------------------------------
+  float alpha = 1, beta = 0;
+  int apply_contrast = Rand(2);
+  if ( contrast_adjustment && apply_contrast ) {
+    float min_alpha = 0.8, max_alpha = 1.2;
+    alpha = rng.uniform(min_alpha, max_alpha);
+    beta = (float)(Rand(6));
+	// flip sign
+	if ( Rand(2) ) beta = - beta;
+    cv_img.convertTo(cv_img, -1 , alpha, beta);
+	if (debug_display && phase_ == TRAIN)
+      cv::imshow("Contrast Adjustment", cv_img);
+  }
+
+  // JPEG Compression -------------------------------------------------------------
+  // DO NOT use the following code as there is some memory leak which I cann't figure out
+  int QF = 100;
+  int apply_JPEG = Rand(2);
+  if ( jpeg_compression && apply_JPEG ) {
+	// JPEG quality factor
+	QF = 95 + 1 * (Rand(6));
+        int cp[] = {cv::IMWRITE_JPEG_QUALITY, QF};
+	vector<int> compression_params(cp,cp + 2);
+        vector<unsigned char> img_jpeg;
+	//cv::imencode(".jpg", cv_img, img_jpeg);
+        cv::imencode(".jpg", cv_img, img_jpeg, compression_params);
+	cv::Mat temp = cv::imdecode(img_jpeg, cv::IMREAD_COLOR);
+        temp.copyTo(cv_img);
+	if (debug_display && phase_ == TRAIN)
+      cv::imshow("JPEG Compression", cv_img);
+  }
+
+  // Histogram Equalization ------------------------------------------------
+  //if ( Rand() % 2 )
+  //	cvEqualizeHist(cv_img, cv_img);
+
+  // Cropping and Padding -----------------------------------------------------------------  
+  /* Since in the end, we will resize the image to a fixed size (i.e. crop_size), so scaling
+   * the image will not make any difference. Therefore, we use cropping and padding to
+   * simulate scaling effect.
+   * For scaling factor > 1, we random crop the original image to simulate scaling up
+   * For scaling factor < 1, we random pad the original image to simulate scaling down
+  */
+  // scaling factor for height and width respectively
+  float sf_w = rng.uniform(min_scaling_factor, max_scaling_factor);
+  float sf_h = rng.uniform(min_scaling_factor, max_scaling_factor);
+  // ROI height and width
+  int roi_width = (int)(width * (1. / sf_w));
+  int roi_height = (int)(height * (1. / sf_h));
+  // random number for w_off and h_oof in cropPadImage function
+  unsigned int rng_w = Rand(width*10), rng_h = Rand(height*10);
+  cv::Mat img_crop_pad = cropPadImage(cv_img, roi_width, roi_height,
+	                                    rng_w, rng_h, warp_fillval);
+  if (debug_display && phase_ == TRAIN)
+      cv::imshow("Cropping and Padding", img_crop_pad);
+
+  // param config for shearing
+  float shearing_ratio_x = rng.uniform(-max_shearing_ratio, max_shearing_ratio);
+  float shearing_ratio_y = rng.uniform(-max_shearing_ratio, max_shearing_ratio);
+
+  // param config for rotation
+  float angle_raw = rng.uniform(0, 360);
+  float angle_quant = angle_interval * ceil(angle_raw / angle_interval + 0.5);
+
+  // param for perspective warpping
+  // for x of four points
+  float perspective_ratio_x[4];
+  perspective_ratio_x[0] = 0 + rng.uniform(-max_perspective_ratio, max_perspective_ratio); // top-left
+  perspective_ratio_x[1] = 1 + rng.uniform(-max_perspective_ratio, max_perspective_ratio); // top-right
+  perspective_ratio_x[2] = 0 + rng.uniform(-max_perspective_ratio, max_perspective_ratio); // bottom-left
+  perspective_ratio_x[3] = 1 + rng.uniform(-max_perspective_ratio, max_perspective_ratio); // bottom-right
+  // for y of four points
+  float perspective_ratio_y[4];
+  perspective_ratio_y[0] = 0 + rng.uniform(-max_perspective_ratio, max_perspective_ratio); // top-left
+  perspective_ratio_y[1] = 0 + rng.uniform(-max_perspective_ratio, max_perspective_ratio); // top-right
+  perspective_ratio_y[2] = 1 + rng.uniform(-max_perspective_ratio, max_perspective_ratio); // bottom-left 
+  perspective_ratio_y[3] = 1 + rng.uniform(-max_perspective_ratio, max_perspective_ratio); // bottom-right
+
+  // random interpolation kernel
+  int interpolation = Rand(5); // see opencv_util.hpp
+
+  // perform perspective warpping in one go
+  cv::Mat dest = warpPerspectiveOneGo(img_crop_pad, crop_size, crop_size,
+	  shearing_ratio_x, shearing_ratio_y, angle_quant, perspective_ratio_x, perspective_ratio_y,
+	  interpolation, warp_fillval);
+  if (debug_display && phase_ == TRAIN)
+      cv::imshow("Warp Perspective in one go", dest);
+  
+
+  //--------------------!! for debug only !!-------------------
+  if (debug_display && phase_ == TRAIN) {
+	LOG(INFO) << "----------------------------------------";
+	LOG(INFO) << "src width: " << width << ", src height: " << height;
+	LOG(INFO) << "dest width: " << crop_size << ", dest height: " << crop_size;
+	if (apply_flipping) {
+		LOG(INFO) << "* parameter for flipping: ";
+		LOG(INFO) << "  flipping_mode: " << flipping_mode;
+	}
+	if ( smooth_filtering && apply_smooth ) {
+          LOG(INFO) << "* parameter for smooth filtering: ";
+	  //LOG(INFO) << "  smooth type: " << smooth_type << ", smooth param1: " << smooth_param1;
+	}
+	if ( contrast_adjustment && apply_contrast ) {
+	  LOG(INFO) << "* parameter for contrast adjustment: ";
+	  LOG(INFO) << "  alpha: " << alpha << ", beta: " << beta;
+	}
+	if ( jpeg_compression && apply_JPEG ) {
+	  LOG(INFO) << "* parameter for JPEG compression: ";
+	  LOG(INFO) << "  QF: " << QF;
+	}
+	LOG(INFO) << "* parameter for cropping and padding: ";
+	LOG(INFO) << "  sf_w: " << sf_w << ", sf_h: " << sf_h;
+	LOG(INFO) << "  roi_width: " << roi_width << ", roi_height: " << roi_height;
+	LOG(INFO) << "* parameter for shearing: ";
+	LOG(INFO) << "  max_shearing_ratio: " << max_shearing_ratio;
+	LOG(INFO) << "  shearing_ratio_x: " << shearing_ratio_x << ", shearing_ratio_y: " << shearing_ratio_y;
+	LOG(INFO) << "* parameter for rotation: ";
+	LOG(INFO) << "  angle_interval: " << angle_interval;
+	LOG(INFO) << "  angle: " << angle_quant;
+	LOG(INFO) << "* parameter for perspective transform:";
+	LOG(INFO) << "  max_perspective_ratio: " << max_perspective_ratio;
+	LOG(INFO) << "  top-left:     [" << perspective_ratio_x[0] << "," << perspective_ratio_y[0] << "]";
+	LOG(INFO) << "  top-right:    [" << perspective_ratio_x[1] << "," << perspective_ratio_y[1] << "]";
+	LOG(INFO) << "  bottom-left:  [" << perspective_ratio_x[2] << "," << perspective_ratio_y[2] << "]";
+	LOG(INFO) << "  bottom-right: [" << perspective_ratio_x[3] << "," << perspective_ratio_y[3] << "]";
+	LOG(INFO) << "* parameter for in-one-go warpping : ";
+	LOG(INFO) << "  interpolation: " << interpolation;
+    cvWaitKey(0);
+  }
+
+  Dtype* mean = NULL;
+  if (has_mean_file) {
+    CHECK_EQ(img_channels, data_mean_.channels());
+    CHECK_EQ(img_height, data_mean_.height());
+    CHECK_EQ(img_width, data_mean_.width());
+    mean = data_mean_.mutable_cpu_data();
+  }
+  
+   if (has_mean_values) {
+    CHECK(mean_values_.size() == 1 || mean_values_.size() == img_channels) <<
+     "Specify either 1 mean_value or as many as channels: " << img_channels;
+    if (img_channels > 1 && mean_values_.size() == 1) {
+      // Replicate the mean_value for simplicity
+      for (int c = 1; c < img_channels; ++c) {
+        mean_values_.push_back(mean_values_[0]);
+      }
+    }
+  }
+  
+  Dtype* transformed_data = transformed_blob->mutable_cpu_data();
+  int top_index;
+  for (int h = 0; h < height; ++h) {
+    const uchar* ptr = dest.ptr<uchar>(h);
+    int img_index = 0;
+    for (int w = 0; w < width; ++w) {
+      for (int c = 0; c < img_channels; ++c) {
+        //if (do_mirror) {
+        //  top_index = (c * height + h) * width + (width - 1 - w);
+        //} else {
+          top_index = (c * height + h) * width + w;
+        //}
+        // int top_index = (c * height + h) * width + w;
+        Dtype pixel = static_cast<Dtype>(ptr[img_index++]);
+        if (has_mean_file) {
+          int mean_index = (c * img_height + h) * img_width + w;
+          transformed_data[top_index] =
+            (pixel - mean[mean_index]) * scale;
+        } else {
+          if (has_mean_values) {
+            transformed_data[top_index] =
+              (pixel - mean_values_[c]) * scale;
+          } else {
+            transformed_data[top_index] = pixel * scale;
+          }
+        }
+      }
+    }
+  }
+
 }
 #endif  // USE_OPENCV
 
