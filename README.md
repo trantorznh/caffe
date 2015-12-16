@@ -1,5 +1,7 @@
 # Caffe
-This project add real-time data augmation based on Chenlong Chen's job
+adding real-time data augmation based on Chenlong Chen's job.
+Temporarily this project only support image augmation.
+
 
 
 original job refer to
